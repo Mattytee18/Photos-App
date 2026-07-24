@@ -685,6 +685,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 let PHOTOS=[];
 let CAN_RECYCLE=false;
 let rawSupport=false;
+let appVersion="";
 let selectMode=false;
 const selected=new Set();
 const state={g:"all",sort:"newest",period:null};
@@ -938,7 +939,8 @@ function refreshSub(){
     rng=` · ${f(Math.min(...ts))} – ${f(Math.max(...ts))}`;
   }
   const scan = scanning ? ` · scanning… (${(scanSeen||PHOTOS.length).toLocaleString()} found)` : '';
-  document.getElementById('sub').textContent=`${imgs.toLocaleString()} photos · ${vids.toLocaleString()} videos${rng}${scan}`;
+  const ver = appVersion ? ` · v${appVersion}${rawSupport?'':' · RAW off'}` : '';
+  document.getElementById('sub').textContent=`${imgs.toLocaleString()} photos · ${vids.toLocaleString()} videos${rng}${scan}${ver}`;
 }
 
 document.addEventListener('keydown',e=>{
@@ -989,6 +991,7 @@ function applyData(data){
   PHOTOS=data.photos||[];
   CAN_RECYCLE=!!data.canRecycle;
   rawSupport=!!data.rawOk;
+  appVersion=data.version||"";
   scanning=!!data.scanning; scanSeen=data.seen||PHOTOS.length;
   refreshSub();
   if(scanning && !PHOTOS.length){
