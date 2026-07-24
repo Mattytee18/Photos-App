@@ -51,6 +51,13 @@ try:
 except Exception:
     HEIF_OK = False
 
+# Optional: decodes camera RAW files (Sony .ARW, Canon .CR2/CR3, Nikon .NEF, etc.)
+try:
+    import rawpy
+    RAW_OK = True
+except Exception:
+    RAW_OK = False
+
 # Optional: sends deleted files to the OS Recycle Bin/Trash (recoverable).
 try:
     from send2trash import send2trash as _send2trash
@@ -271,9 +278,10 @@ def scan(folders, debug=False):
         print(f"i  {heic:,} HEIC/HEIF photos found. To view them, install pillow-heif:  "
               f"pip install pillow-heif")
     raws = sum(1 for p in PHOTOS if os.path.splitext(p["name"])[1].lower() in RAW_EXTS)
-    if raws:
-        print(f"i  {raws:,} camera RAW files are included and dated; they show a placeholder "
-              f"thumbnail unless your Pillow can decode them.")
+    if raws and not RAW_OK:
+        print(f"i  {raws:,} camera RAW files found. To view them, install rawpy:  pip install rawpy")
+    elif raws:
+        print(f"i  {raws:,} camera RAW files — showing their embedded previews.")
     if vids and not FFMPEG:
         print("i  ffmpeg not found — videos play, but show a placeholder thumbnail.")
 
@@ -301,6 +309,30 @@ def _cache_path(pid, mtime, suffix):
     return os.path.join(THUMB_DIR, f"{pid}_{mtime}{suffix}.jpg")
 
 
+def raw_jpeg_bytes(path, max_dim, quality):
+    """Turn a camera RAW file into a JPEG. Uses the full-size preview embedded
+    in the RAW when available (fast); otherwise develops the RAW (slower)."""
+    with rawpy.imread(path) as raw:
+        im = None
+        try:
+            thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                im = Image.open(io.BytesIO(thumb.data))
+            elif thumb.format == rawpy.ThumbFormat.BITMAP:
+                im = Image.fromarray(thumb.data)
+        except Exception:
+            im = None
+        if im is None:
+            rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=False)
+            im = Image.fromarray(rgb)
+    im = ImageOps.exif_transpose(im).convert("RGB")
+    if max(im.size) > max_dim:
+        im.thumbnail((max_dim, max_dim))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
 def make_image_thumb(path, pid):
     try:
         mtime = int(os.path.getmtime(path))
@@ -310,15 +342,19 @@ def make_image_thumb(path, pid):
     if os.path.exists(cache_file):
         with open(cache_file, "rb") as f:
             return f.read()
+    ext = os.path.splitext(path)[1].lower()
     try:
-        with Image.open(path) as img:
-            img.draft("RGB", THUMB_SIZE)          # fast JPEG downscale-on-decode
-            img = ImageOps.exif_transpose(img)    # honor camera rotation
-            img = img.convert("RGB")
-            img.thumbnail(THUMB_SIZE)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=82)
-            data = buf.getvalue()
+        if ext in RAW_EXTS and RAW_OK:
+            data = raw_jpeg_bytes(path, max(THUMB_SIZE), 82)
+        else:
+            with Image.open(path) as img:
+                img.draft("RGB", THUMB_SIZE)          # fast JPEG downscale-on-decode
+                img = ImageOps.exif_transpose(img)    # honor camera rotation
+                img = img.convert("RGB")
+                img.thumbnail(THUMB_SIZE)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=82)
+                data = buf.getvalue()
         with open(cache_file, "wb") as f:
             f.write(data)
         return data
@@ -337,16 +373,20 @@ def make_preview(path, pid):
     if os.path.exists(cache_file):
         with open(cache_file, "rb") as f:
             return f.read()
+    ext = os.path.splitext(path)[1].lower()
     try:
-        with Image.open(path) as img:
-            img.draft("RGB", (PREVIEW_MAX, PREVIEW_MAX))
-            img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB")
-            if max(img.size) > PREVIEW_MAX:
-                img.thumbnail((PREVIEW_MAX, PREVIEW_MAX))
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=PREVIEW_QUALITY)
-            data = buf.getvalue()
+        if ext in RAW_EXTS and RAW_OK:
+            data = raw_jpeg_bytes(path, PREVIEW_MAX, PREVIEW_QUALITY)
+        else:
+            with Image.open(path) as img:
+                img.draft("RGB", (PREVIEW_MAX, PREVIEW_MAX))
+                img = ImageOps.exif_transpose(img)
+                img = img.convert("RGB")
+                if max(img.size) > PREVIEW_MAX:
+                    img.thumbnail((PREVIEW_MAX, PREVIEW_MAX))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=PREVIEW_QUALITY)
+                data = buf.getvalue()
         with open(cache_file, "wb") as f:
             f.write(data)
         return data
@@ -511,6 +551,40 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .badge svg{width:11px;height:11px;fill:#fff;}
   .empty{color:var(--muted);padding:60px;text-align:center;}
 
+  /* selection */
+  .sortbtn.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent;}
+  .check{position:absolute;top:8px;left:8px;width:24px;height:24px;border-radius:50%;
+         border:2px solid rgba(255,255,255,.85);background:rgba(10,12,16,.35);display:none;
+         align-items:center;justify-content:center;z-index:3;}
+  body.selectmode .check{display:flex;}
+  body.selectmode .cell{cursor:pointer;}
+  body.selectmode .cell:hover{transform:none;}
+  .cell.sel .check{background:var(--accent);border-color:#fff;}
+  .cell.sel .check::after{content:"";width:6px;height:11px;border:solid #fff;border-width:0 2px 2px 0;
+         transform:rotate(45deg);margin-top:-2px;}
+  .cell.sel{outline:3px solid var(--accent);outline-offset:-3px;}
+  .cell.sel img{transform:scale(.92);}
+
+  #selbar{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:40;display:none;
+          align-items:center;gap:16px;padding:10px 12px 10px 20px;border-radius:16px;
+          background:rgba(21,25,34,.96);backdrop-filter:blur(12px);border:1px solid var(--line);
+          box-shadow:var(--shadow);}
+  #selbar #selcount{font-size:13.5px;font-weight:600;}
+  .sb-actions{display:flex;gap:8px;}
+  .sb-btn{border:1px solid var(--line);background:var(--surface2);color:var(--text);
+          font-size:13px;font-weight:600;padding:8px 14px;border-radius:10px;cursor:pointer;transition:.15s;}
+  .sb-btn:hover{background:#232a37;}
+  .sb-btn.danger{background:linear-gradient(135deg,#ff5c6c,#ff7a45);border-color:transparent;color:#fff;}
+  .sb-btn.danger:hover{filter:brightness(1.08);}
+
+  #ctx{position:fixed;z-index:70;display:none;min-width:160px;padding:6px;border-radius:12px;
+       background:rgba(24,28,38,.98);backdrop-filter:blur(12px);border:1px solid var(--line);
+       box-shadow:var(--shadow);}
+  #ctx .ci{padding:9px 12px;border-radius:8px;font-size:13.5px;cursor:pointer;color:var(--text);}
+  #ctx .ci:hover{background:var(--surface2);}
+  #ctx .ci.danger{color:#ff6b78;}
+  #ctx .ci.danger:hover{background:rgba(255,86,86,.16);}
+
   /* lightbox */
   #lb{position:fixed;inset:0;z-index:60;display:none;align-items:center;justify-content:center;
       background:rgba(6,7,10,.86);backdrop-filter:blur(10px);}
@@ -556,6 +630,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <svg viewBox="0 0 24 24"><path d="M12 4v16M12 4l-5 5M12 4l5 5"/></svg>
     <span id="sortlabel">Newest</span>
   </button>
+  <button class="sortbtn" id="selectbtn" title="Select multiple to delete">
+    <svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
+    <span>Select</span>
+  </button>
   <button class="sortbtn" id="pickbtn" style="display:none" title="Choose a different folder">
     <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
     <span>Folder</span>
@@ -580,9 +658,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <button class="iconbtn lbnav next" onclick="step(1)"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
 </div>
 
+<div id="ctx">
+  <div class="ci" onclick="ctxOpen()">Open</div>
+  <div class="ci" onclick="ctxSelect()">Select</div>
+  <div class="ci danger" onclick="ctxDelete()">Delete</div>
+</div>
+
+<div id="selbar">
+  <span id="selcount">0 selected</span>
+  <div class="sb-actions">
+    <button class="sb-btn" onclick="selectAllVisible()">Select all shown</button>
+    <button class="sb-btn" onclick="clearSelection()">Clear</button>
+    <button class="sb-btn danger" onclick="deleteSelected()">Delete</button>
+    <button class="sb-btn" onclick="setSelectMode(false)">Done</button>
+  </div>
+</div>
+
 <script>
 let PHOTOS=[];
 let CAN_RECYCLE=false;
+let selectMode=false;
+const selected=new Set();
 const state={g:"all",sort:"newest",period:null};
 let viewList=[];
 let lbIndex=0;
@@ -625,7 +721,7 @@ function groupBy(g){
 
 function cellHTML(p){
   const badge=p.kind==="video"?`<div class="badge">${PLAY}</div>`:"";
-  return `<div class="cell" data-idx="__IDX__"><img loading="lazy" src="/thumb?id=${p.id}" alt="">${badge}<div class="cap">${p.iso}</div></div>`;
+  return `<div class="cell" data-idx="__IDX__" data-id="${p.id}"><img loading="lazy" src="/thumb?id=${p.id}" alt="">${badge}<div class="cap">${p.iso}</div><div class="check"></div></div>`;
 }
 function gridHTML(items,offset){
   let h='<div class="grid">';
@@ -693,7 +789,86 @@ function renderPeriods(){
     ${gridHTML(sel.items,0)}</section>`;
   main.scrollTop=0; bindCells();
 }
-function bindCells(){ main.querySelectorAll('.cell').forEach(c=>{ c.onclick=()=>openLb(parseInt(c.dataset.idx,10)); }); }
+function bindCells(){
+  main.querySelectorAll('.cell').forEach(c=>{
+    c.onclick=()=>{ if(selectMode) toggleSelect(c.dataset.id,c); else openLb(parseInt(c.dataset.idx,10)); };
+    c.oncontextmenu=(e)=>{ e.preventDefault(); showCtx(e.clientX,e.clientY,parseInt(c.dataset.idx,10),c.dataset.id); };
+  });
+  applySelectionClasses();
+}
+
+// ---- multi-select ----
+function setSelectMode(on){
+  selectMode=on;
+  if(!on) selected.clear();
+  document.getElementById('selectbtn').classList.toggle('active',on);
+  applySelectionClasses();
+}
+function toggleSelect(id,el){
+  if(selected.has(id)){ selected.delete(id); el&&el.classList.remove('sel'); }
+  else { selected.add(id); el&&el.classList.add('sel'); }
+  updateSelBar();
+}
+function applySelectionClasses(){
+  document.body.classList.toggle('selectmode',selectMode);
+  main.querySelectorAll('.cell').forEach(c=>c.classList.toggle('sel',selected.has(c.dataset.id)));
+  updateSelBar();
+}
+function updateSelBar(){
+  const bar=document.getElementById('selbar');
+  if(selectMode && selected.size>0){ bar.style.display='flex'; document.getElementById('selcount').textContent=`${selected.size} selected`; }
+  else bar.style.display='none';
+}
+function clearSelection(){ selected.clear(); applySelectionClasses(); }
+function selectAllVisible(){ viewList.forEach(p=>selected.add(p.id)); applySelectionClasses(); }
+async function deleteSelected(){
+  if(!selected.size) return;
+  const ids=[...selected];
+  const msg=CAN_RECYCLE
+    ? `Move ${ids.length} item${ids.length!==1?'s':''} to the Recycle Bin?`
+    : `Permanently delete ${ids.length} item${ids.length!==1?'s':''}?\nThis cannot be undone.`;
+  if(!window.confirm(msg)) return;
+  let j;
+  try{ const r=await fetch('/delete_many?ids='+encodeURIComponent(ids.join(',')),{method:'POST'}); j=await r.json(); }
+  catch(e){ alert('Delete failed: '+e); return; }
+  if(!j||!j.ok){ alert('Delete failed.'); return; }
+  const gone=new Set(ids);
+  PHOTOS=PHOTOS.filter(p=>!gone.has(p.id));
+  selected.clear();
+  refreshSub();
+  const sc=main.scrollTop; render(); main.scrollTop=sc;
+  updateSelBar();
+}
+
+// ---- right-click context menu ----
+function showCtx(x,y,idx,id){
+  const m=document.getElementById('ctx');
+  m.dataset.idx=idx; m.dataset.id=id;
+  m.style.display='block';
+  m.style.left=Math.min(x,window.innerWidth-m.offsetWidth-8)+'px';
+  m.style.top=Math.min(y,window.innerHeight-m.offsetHeight-8)+'px';
+}
+function hideCtx(){ document.getElementById('ctx').style.display='none'; }
+function ctxOpen(){ const i=parseInt(document.getElementById('ctx').dataset.idx,10); hideCtx(); openLb(i); }
+function ctxSelect(){ const id=document.getElementById('ctx').dataset.id; hideCtx(); setSelectMode(true); selected.add(id); applySelectionClasses(); }
+function ctxDelete(){ const id=document.getElementById('ctx').dataset.id; hideCtx(); delById(id); }
+document.addEventListener('click',hideCtx);
+document.addEventListener('scroll',hideCtx,true);
+
+async function delById(id){
+  const p=PHOTOS.find(x=>x.id===id); if(!p) return;
+  const msg=CAN_RECYCLE
+    ? `Move this ${p.kind} to the Recycle Bin?\n\n${p.name}`
+    : `Permanently delete this ${p.kind}?\n\n${p.name}\n\nThis cannot be undone.`;
+  if(!window.confirm(msg)) return;
+  let j;
+  try{ const r=await fetch('/delete?id='+encodeURIComponent(id),{method:'POST'}); j=await r.json(); }
+  catch(e){ alert('Delete failed: '+e); return; }
+  if(!j||!j.ok){ alert('Delete failed: '+((j&&j.error)||'unknown')); return; }
+  PHOTOS=PHOTOS.filter(x=>x.id!==id); selected.delete(id);
+  refreshSub();
+  const sc=main.scrollTop; render(); main.scrollTop=sc;
+}
 
 // lightbox — images load a downscaled preview (fast, and converts HEIC etc.)
 function openLb(i){
@@ -776,6 +951,14 @@ sortBtn.addEventListener('click',()=>{
   document.getElementById('sortlabel').textContent=state.sort==="newest"?"Newest":"Oldest";
   render();
 });
+document.getElementById('selectbtn').addEventListener('click',()=>setSelectMode(!selectMode));
+document.addEventListener('keydown',e=>{
+  if(document.getElementById('lb').classList.contains('open')) return;
+  if(e.key==="Escape"){
+    if(document.getElementById('ctx').style.display==='block') hideCtx();
+    else if(selectMode) setSelectMode(false);
+  }
+});
 
 // "Change folder" — only shown when running as the native app (pywebview present)
 const pickBtn=document.getElementById('pickbtn');
@@ -824,6 +1007,35 @@ CTYPE = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
          ".tif": "image/tiff", ".tiff": "image/tiff",
          ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
          ".webm": "video/webm", ".3gp": "video/3gpp"}
+
+
+def _delete_file(pid):
+    """Delete one item by id. Returns (ok, recycled, error)."""
+    global PHOTOS
+    fp = ID_TO_PATH.get(pid)
+    if not fp or not os.path.exists(fp):
+        return False, False, "not found"
+    recycled = False
+    try:
+        if _send2trash is not None:
+            _send2trash(fp)
+            recycled = True
+        else:
+            os.remove(fp)
+    except Exception as e:
+        return False, False, str(e)
+    ID_TO_PATH.pop(pid, None)
+    PHOTOS = [p for p in PHOTOS if p["id"] != pid]
+    try:
+        for fn in os.listdir(THUMB_DIR):
+            if fn.startswith(pid + "_"):
+                try:
+                    os.remove(os.path.join(THUMB_DIR, fn))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return True, recycled, None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -893,35 +1105,27 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         if parsed.path == "/delete":
             pid = (qs.get("id") or [""])[0]
-            fp = ID_TO_PATH.get(pid)
-            if not fp or not os.path.exists(fp):
-                self._send(404, "application/json", b'{"ok":false,"error":"not found"}')
-                return
-            recycled = False
-            try:
-                if _send2trash is not None:
-                    _send2trash(fp)
-                    recycled = True
+            ok, recycled, err = _delete_file(pid)
+            code = 404 if (not ok and err == "not found") else 200
+            self._send(code, "application/json",
+                       json.dumps({"ok": ok, "recycled": recycled, "error": err}).encode("utf-8"))
+            return
+        if parsed.path == "/delete_many":
+            ids = (qs.get("ids") or [""])[0]
+            id_list = [x for x in ids.split(",") if x]
+            deleted = 0
+            recycled_any = False
+            failed = []
+            for pid in id_list:
+                ok, recycled, err = _delete_file(pid)
+                if ok:
+                    deleted += 1
+                    recycled_any = recycled_any or recycled
                 else:
-                    os.remove(fp)
-            except Exception as e:
-                self._send(200, "application/json",
-                           json.dumps({"ok": False, "error": str(e)}).encode("utf-8"))
-                return
-            ID_TO_PATH.pop(pid, None)
-            global PHOTOS
-            PHOTOS = [p for p in PHOTOS if p["id"] != pid]
-            try:
-                for fn in os.listdir(THUMB_DIR):
-                    if fn.startswith(pid + "_"):
-                        try:
-                            os.remove(os.path.join(THUMB_DIR, fn))
-                        except OSError:
-                            pass
-            except OSError:
-                pass
+                    failed.append(pid)
             self._send(200, "application/json",
-                       json.dumps({"ok": True, "recycled": recycled}).encode("utf-8"))
+                       json.dumps({"ok": True, "deleted": deleted,
+                                   "recycled": recycled_any, "failed": failed}).encode("utf-8"))
             return
         self._send(404, "text/plain", b"not found")
 
