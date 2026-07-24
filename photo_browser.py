@@ -43,20 +43,26 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
+APP_VERSION = "1.1"
+
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
     HEIF_OK = True
-except Exception:
+    HEIF_ERR = None
+except Exception as _e:
     HEIF_OK = False
+    HEIF_ERR = repr(_e)
 
 # Optional: decodes camera RAW files (Sony .ARW, Canon .CR2/CR3, Nikon .NEF, etc.)
 try:
     import rawpy
     RAW_OK = True
-except Exception:
+    RAW_ERR = None
+except Exception as _e:
     RAW_OK = False
+    RAW_ERR = repr(_e)
 
 # Optional: sends deleted files to the OS Recycle Bin/Trash (recoverable).
 try:
@@ -244,6 +250,7 @@ def scan(folders, debug=False):
                     "kind": kind,
                     "playable": ext in WEB_PLAYABLE,
                     "web": ext in WEB_IMG,
+                    "raw": ext in RAW_EXTS,
                 })
                 ID_TO_PATH[pid] = full
                 count += 1
@@ -677,6 +684,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 let PHOTOS=[];
 let CAN_RECYCLE=false;
+let rawSupport=false;
 let selectMode=false;
 const selected=new Set();
 const state={g:"all",sort:"newest",period:null};
@@ -888,8 +896,11 @@ function openLb(i){
       // 2) then sharpen to the full-resolution original (for browser-native formats)
       if(p.web){ const full=new Image(); full.onload=()=>show(full); full.src=`/full?id=${p.id}`; }
     };
-    fast.onerror=()=>{ if(viewList[lbIndex]===p) box.innerHTML=`<div class="lberr">Couldn't display <b>${p.name}</b>.<br>
-      <span style="color:#9aa1ad">If it's an iPhone HEIC or camera RAW file, see the README for the optional add-on.</span></div>`; };
+    fast.onerror=()=>{ if(viewList[lbIndex]!==p) return;
+      let hint="If it's an iPhone HEIC file, install pillow-heif (see README).";
+      if(p.raw && !rawSupport) hint="RAW support isn't loaded in this build — the rawpy library didn't bundle into the .exe. Rebuild, then check startup.log (see below).";
+      else if(p.raw) hint="This RAW file couldn't be decoded.";
+      box.innerHTML=`<div class="lberr">Couldn't display <b>${p.name}</b>.<br><span style="color:#9aa1ad">${hint}</span></div>`; };
     fast.src=`/preview?id=${p.id}`;
   }
   document.getElementById('lbinfo').innerHTML=`<b>${p.name}</b><span>${p.iso}${p.kind==='video'?' · Video':''}</span>`;
@@ -977,6 +988,7 @@ let scanning=false, scanSeen=0, pollTimer=null;
 function applyData(data){
   PHOTOS=data.photos||[];
   CAN_RECYCLE=!!data.canRecycle;
+  rawSupport=!!data.rawOk;
   scanning=!!data.scanning; scanSeen=data.seen||PHOTOS.length;
   refreshSub();
   if(scanning && !PHOTOS.length){
@@ -1154,6 +1166,7 @@ class Handler(BaseHTTPRequestHandler):
             summary = f"{imgs:,} photos · {vids:,} videos"
             body = json.dumps({"photos": snap, "range": rng, "summary": summary,
                                "canRecycle": _send2trash is not None,
+                               "rawOk": RAW_OK, "heifOk": HEIF_OK, "version": APP_VERSION,
                                "scanning": not SCAN["done"], "seen": SCAN["seen"]}).encode("utf-8")
             self._send(200, "application/json", body)
             return
@@ -1243,6 +1256,30 @@ def _log_error(text):
         pass
 
 
+def write_startup_log(folders):
+    """Write which optional features loaded, so problems are easy to diagnose."""
+    lines = [
+        f"Photo Browser {APP_VERSION}",
+        f"time: {datetime.now().isoformat(timespec='seconds')}",
+        f"python: {sys.version.split()[0]}",
+        f"running as bundled .exe: {getattr(sys, 'frozen', False)}",
+        f"folders: {folders}",
+        f"RAW (rawpy) loaded: {RAW_OK}" +
+        (f"  [rawpy {getattr(rawpy, '__version__', '?')}]" if RAW_OK else f"  ERROR: {RAW_ERR}"),
+        f"HEIC (pillow-heif) loaded: {HEIF_OK}" + ("" if HEIF_OK else f"  ERROR: {HEIF_ERR}"),
+        f"Recycle Bin (send2trash): {_send2trash is not None}",
+        f"ffmpeg: {FFMPEG or 'not found'}",
+    ]
+    txt = "\n".join(lines) + "\n"
+    print(txt)
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(os.path.join(CONFIG_DIR, "startup.log"), "w", encoding="utf-8") as f:
+            f.write(txt)
+    except Exception:
+        pass
+
+
 def _show_error_box(text):
     try:
         import tkinter as tk
@@ -1318,6 +1355,8 @@ def _run_main():
     folders = [f for f in folders if os.path.isdir(f)]
     if not folders:
         sys.exit("No valid folder to scan. Run again to pick one.")
+
+    write_startup_log(folders)
 
     # Start the web server, then scan in the background so the window shows at once.
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

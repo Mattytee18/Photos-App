@@ -32,6 +32,7 @@ jobs:
           --collect-all pywebview
           --collect-all pillow_heif
           --collect-all rawpy
+          --collect-all numpy
           --hidden-import tkinter --hidden-import tkinter.filedialog
           --hidden-import send2trash
           photo_browser.py
