@@ -1,0 +1,10 @@
+# Core (required)
+Pillow>=10.0
+
+# Optional but recommended
+pillow-heif>=0.13    # view iPhone / HEIC photos
+send2trash>=1.8      # delete to the Recycle Bin (recoverable)
+pywebview>=4.4       # open in a native app window instead of a browser
+
+# Only needed to BUILD the standalone .exe (see build_windows.bat)
+# pyinstaller>=6.0
