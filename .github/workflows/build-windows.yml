@@ -1,0 +1,43 @@
+name: Build Windows EXE
+
+# Runs automatically on every push, and can also be started by hand
+# from the Actions tab ("Run workflow").
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pillow pillow-heif send2trash pywebview pyinstaller
+
+      - name: Build the .exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name "Photo Browser"
+          --icon app_icon.ico
+          --collect-all pywebview
+          --collect-all pillow_heif
+          --hidden-import tkinter --hidden-import tkinter.filedialog
+          --hidden-import send2trash
+          photo_browser.py
+
+      - name: Upload the .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: Photo-Browser-Windows
+          path: "dist/Photo Browser.exe"
+          if-no-files-found: error
