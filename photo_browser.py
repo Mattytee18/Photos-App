@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,7 +44,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -1136,7 +1137,7 @@ async function deletePhotos(reps){
   PHOTOS=PHOTOS.filter(p=>!gone.has(p.id));
   gone.forEach(i=>selected.delete(i));
   refreshSub();
-  if(failed.size) alert(`${failed.size} file(s) couldn't be deleted (they may be open or read-only).`);
+  if(failed.size){ const why=(j.errors&&j.errors.length)?('\n\nReason: '+j.errors.join('\n')):''; alert(`${failed.size} file(s) couldn't be deleted.${why}`); }
   return true;
 }
 async function deleteSelected(){
@@ -1362,7 +1363,7 @@ async function dupDelete(){
   const failed=new Set(j.failed||[]);
   const gone=new Set(ids); failed.forEach(f=>gone.delete(f));
   PHOTOS=PHOTOS.filter(p=>!gone.has(p.id)); refreshSub(); render();
-  if(failed.size) alert(`${failed.size} file(s) couldn't be deleted (they may be open or read-only).`);
+  if(failed.size){ const why=(j.errors&&j.errors.length)?('\n\nReason: '+j.errors.join('\n')):''; alert(`${failed.size} file(s) couldn't be deleted.${why}`); }
   openDup();
 }
 document.addEventListener('keydown',e=>{
@@ -1431,15 +1432,23 @@ def _delete_file(pid):
     fp = ID_TO_PATH.get(pid)
     if not fp or not os.path.exists(fp):
         return False, False, "not found"
-    recycled = False
-    try:
+
+    def _do():
         if _send2trash is not None:
             _send2trash(fp)
-            recycled = True
-        else:
-            os.remove(fp)
-    except Exception as e:
-        return False, False, str(e)
+            return True
+        os.remove(fp)
+        return False
+
+    try:
+        recycled = _do()
+    except Exception as e1:
+        # Common Windows cause: the file is read-only. Clear it and retry.
+        try:
+            os.chmod(fp, stat.S_IWRITE)
+            recycled = _do()
+        except Exception as e2:
+            return False, False, str(e2 or e1)
     ID_TO_PATH.pop(pid, None)
     PHOTOS = [p for p in PHOTOS if p["id"] != pid]
     try:
@@ -1532,6 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
             deleted = 0
             recycled_any = False
             failed = []
+            errors = []
             for pid in id_list:
                 ok, recycled, err = _delete_file(pid)
                 if ok:
@@ -1539,9 +1549,12 @@ class Handler(BaseHTTPRequestHandler):
                     recycled_any = recycled_any or recycled
                 else:
                     failed.append(pid)
+                    if err and err not in errors and len(errors) < 4:
+                        errors.append(err)
             self._send(200, "application/json",
                        json.dumps({"ok": True, "deleted": deleted,
-                                   "recycled": recycled_any, "failed": failed}).encode("utf-8"))
+                                   "recycled": recycled_any, "failed": failed,
+                                   "errors": errors}).encode("utf-8"))
             return
         self._send(404, "text/plain", b"not found")
 
