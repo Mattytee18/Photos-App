@@ -43,7 +43,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -242,6 +242,9 @@ def scan(folders, debug=False):
                 seen_files.add(real_file)
                 dt = read_taken_date(full, kind)
                 pid = hashlib.md5(full.encode("utf-8", "surrogatepass")).hexdigest()
+                stem = os.path.splitext(fname)[0].lower()
+                gkey = hashlib.md5((os.path.normcase(dirpath) + "|" + stem)
+                                   .encode("utf-8", "surrogatepass")).hexdigest()[:16]
                 PHOTOS.append({
                     "id": pid,
                     "name": fname,
@@ -251,6 +254,7 @@ def scan(folders, debug=False):
                     "playable": ext in WEB_PLAYABLE,
                     "web": ext in WEB_IMG,
                     "raw": ext in RAW_EXTS,
+                    "group": gkey,
                 })
                 ID_TO_PATH[pid] = full
                 count += 1
@@ -506,6 +510,162 @@ def prewarm_thumbnails():
     t.start()
 
 
+# ---------------------------------------------------------------- EXIF / metadata
+
+def _rat(v):
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return v[0] / v[1]
+        except Exception:
+            return None
+
+
+def _human_size(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return (f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}")
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _gps_decimal(vals, ref):
+    try:
+        d, m, s = [_rat(x) for x in vals]
+        dec = d + m / 60.0 + s / 3600.0
+        if str(ref).upper() in ("S", "W"):
+            dec = -dec
+        return dec
+    except Exception:
+        return None
+
+
+def _exif_source_image(path, ext):
+    """Return a PIL image to read EXIF from — for RAW, use the embedded JPEG."""
+    try:
+        if ext in RAW_EXTS:
+            seg = _largest_embedded_jpeg(path)
+            return Image.open(io.BytesIO(seg)) if seg else None
+        return Image.open(path)
+    except Exception:
+        return None
+
+
+def read_exif(path, kind):
+    """Return a dict of friendly EXIF fields for a photo."""
+    ext = os.path.splitext(path)[1].lower()
+    out = {}
+    w = h = None
+    if kind == "image":
+        img = _exif_source_image(path, ext)
+        if img is not None:
+            try:
+                w, h = img.size
+                exif = img.getexif()
+                if exif:
+                    make = str(exif.get(271) or "").strip()
+                    model = str(exif.get(272) or "").strip()
+                    if model and make and not model.lower().startswith(make.lower()):
+                        out["Camera"] = f"{make} {model}"
+                    elif model or make:
+                        out["Camera"] = model or make
+                    sub = {}
+                    try:
+                        sub = exif.get_ifd(0x8769)
+                    except Exception:
+                        sub = {}
+                    lens = sub.get(42036)
+                    if lens:
+                        out["Lens"] = str(lens).strip()
+                    et = _rat(sub.get(33434))
+                    if et:
+                        out["Shutter"] = f"{et:g} s" if et >= 1 else f"1/{round(1/et)} s"
+                    fn = _rat(sub.get(33437))
+                    if fn:
+                        out["Aperture"] = f"f/{fn:g}"
+                    iso = sub.get(34855) or sub.get(34867)
+                    if isinstance(iso, (list, tuple)):
+                        iso = iso[0] if iso else None
+                    if iso:
+                        out["ISO"] = str(iso)
+                    fl = _rat(sub.get(37386))
+                    if fl:
+                        out["Focal length"] = f"{fl:g} mm"
+                    ew, eh = sub.get(40962), sub.get(40963)
+                    if ew and eh:
+                        w, h = ew, eh
+                    try:
+                        gps = exif.get_ifd(0x8825)
+                    except Exception:
+                        gps = {}
+                    lat = _gps_decimal(gps.get(2), gps.get(1))
+                    lon = _gps_decimal(gps.get(4), gps.get(3))
+                    if lat is not None and lon is not None:
+                        out["Location"] = f"{lat:.5f}, {lon:.5f}"
+                        out["_map"] = f"https://www.google.com/maps?q={lat:.6f},{lon:.6f}"
+            except Exception:
+                pass
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+    if w and h:
+        out["Dimensions"] = f"{w} x {h}"
+        mp = (w * h) / 1_000_000
+        if mp >= 1:
+            out["Dimensions"] += f"  ({mp:.0f} MP)"
+    try:
+        out["Size"] = _human_size(os.path.getsize(path))
+    except Exception:
+        pass
+    return out
+
+
+def _file_hash(fp):
+    try:
+        h = hashlib.sha1()
+        with open(fp, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.digest()
+    except Exception:
+        return None
+
+
+def find_duplicates():
+    """Find exact-duplicate files (same content). Returns list of groups."""
+    from collections import defaultdict
+    by_size = defaultdict(list)
+    for pid, fp in list(ID_TO_PATH.items()):
+        try:
+            by_size[os.path.getsize(fp)].append(pid)
+        except OSError:
+            pass
+    groups = []
+    for size, pids in by_size.items():
+        if len(pids) < 2:
+            continue
+        by_hash = defaultdict(list)
+        for pid in pids:
+            hh = _file_hash(ID_TO_PATH.get(pid, ""))
+            if hh:
+                by_hash[hh].append(pid)
+        for _hh, g in by_hash.items():
+            if len(g) > 1:
+                groups.append({
+                    "ids": g,
+                    "name": os.path.basename(ID_TO_PATH.get(g[0], "")),
+                    "size": size,
+                    "sizeText": _human_size(size),
+                    "count": len(g),
+                })
+    groups.sort(key=lambda x: -x["size"] * (x["count"] - 1))
+    return groups
+
+
 # ---------------------------------------------------------------- HTML
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -634,6 +794,39 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #ctx .ci.danger{color:#ff6b78;}
   #ctx .ci.danger:hover{background:rgba(255,86,86,.16);}
 
+  /* group badge on grid tiles */
+  .gbadge{position:absolute;bottom:8px;left:8px;padding:2px 7px;border-radius:20px;
+          background:rgba(124,92,255,.85);color:#fff;font-size:10px;font-weight:700;letter-spacing:.02em;z-index:3;}
+
+  /* EXIF info panel (inside lightbox) */
+  #exif{position:fixed;top:0;right:0;height:100vh;width:300px;z-index:3;padding:74px 20px 20px;
+        background:rgba(16,19,26,.92);backdrop-filter:blur(14px);border-left:1px solid var(--line);
+        transform:translateX(100%);transition:transform .22s ease;overflow-y:auto;}
+  #exif.show{transform:translateX(0);}
+  .exif-h{font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted2);margin-bottom:14px;}
+  .exrow{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;}
+  .exk{color:var(--muted);} .exv{color:var(--text);text-align:right;font-variant-numeric:tabular-nums;}
+  .exmap{display:inline-block;margin-top:14px;color:#8ab4ff;font-size:13px;text-decoration:none;}
+  .exmap:hover{text-decoration:underline;}
+
+  /* duplicates view */
+  #dupview{position:fixed;inset:0;z-index:55;display:none;flex-direction:column;background:var(--bg);}
+  .dup-top{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 22px;border-bottom:1px solid var(--line);
+           position:sticky;top:0;background:rgba(11,13,18,.9);backdrop-filter:blur(12px);}
+  #dupbody{flex:1;overflow-y:auto;padding:18px 22px 60px;}
+  .dupgroup{margin-bottom:26px;}
+  .dupg-h{font-size:13px;color:var(--muted);margin-bottom:10px;}
+  .dupg-row{display:flex;gap:12px;flex-wrap:wrap;}
+  .dupitem{position:relative;width:150px;height:150px;border-radius:12px;overflow:hidden;cursor:pointer;
+           background:var(--surface);border:2px solid transparent;}
+  .dupitem img{width:100%;height:100%;object-fit:cover;}
+  .dupitem-tag{position:absolute;bottom:0;left:0;right:0;padding:5px 8px;font-size:11px;font-weight:700;
+               text-align:center;background:linear-gradient(transparent,rgba(0,0,0,.8));color:#7fe0a3;}
+  .dupitem .delmark{color:#ff7a86;}
+  .dupitem.sel{border-color:#ff5c6c;}
+  .dupitem.sel img{opacity:.5;}
+  .dupitem.keep{border-color:#3ecf8e;}
+
   /* lightbox */
   #lb{position:fixed;inset:0;z-index:60;display:none;align-items:center;justify-content:center;
       background:rgba(6,7,10,.86);backdrop-filter:blur(10px);}
@@ -685,6 +878,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
     <span>Select</span>
   </button>
+  <button class="sortbtn" id="groupbtn" title="Group a RAW and its matching JPEG into one tile">
+    <svg viewBox="0 0 24 24"><path d="M8 8h12v12H8zM4 4h12v12"/></svg>
+    <span>Group</span>
+  </button>
+  <button class="sortbtn" id="dupbtn" title="Find duplicate files to clean up">
+    <svg viewBox="0 0 24 24"><path d="M9 9h11v11H9zM4 15V4h11"/></svg>
+    <span>Duplicates</span>
+  </button>
   <button class="sortbtn" id="pickbtn" style="display:none" title="Choose a different folder">
     <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
     <span>Folder</span>
@@ -700,10 +901,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="lbbar">
     <div class="info" id="lbinfo"></div>
     <div class="lbactions">
+      <button class="iconbtn" onclick="toggleExif()" title="Photo info (i)"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></button>
       <button class="iconbtn danger" onclick="del()" title="Delete (Del)"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M10 11v6M14 11v6M6 7l1 13h10l1-13"/></svg></button>
       <button class="iconbtn" onclick="closeLb()" title="Close (Esc)"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     </div>
   </div>
+  <div id="exif"><div class="exif-h">Photo info</div><div id="exifbody"></div></div>
   <button class="iconbtn lbnav prev" onclick="step(-1)"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
   <div id="lbcontent"></div>
   <button class="iconbtn lbnav next" onclick="step(1)"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
@@ -713,6 +916,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="ci" onclick="ctxOpen()">Open</div>
   <div class="ci" onclick="ctxSelect()">Select</div>
   <div class="ci danger" onclick="ctxDelete()">Delete</div>
+</div>
+
+<div id="dupview">
+  <div class="dup-top">
+    <div><b>Duplicate files</b> &nbsp;<span id="dupsummary" style="color:var(--muted)"></span></div>
+    <div class="sb-actions">
+      <button class="sb-btn" onclick="dupSelectExtras()">Select all extras</button>
+      <button class="sb-btn danger" onclick="dupDelete()">Delete selected</button>
+      <button class="sb-btn" onclick="closeDup()">Close</button>
+    </div>
+  </div>
+  <div id="dupbody"></div>
 </div>
 
 <div id="selbar">
@@ -732,7 +947,7 @@ let rawSupport=false;
 let appVersion="";
 let selectMode=false;
 const selected=new Set();
-const state={g:"all",sort:"newest",period:null};
+const state={g:"all",sort:"newest",period:null,group:false};
 let viewList=[];
 let lbIndex=0;
 let monthObserver=null;
@@ -761,7 +976,7 @@ function keyFor(d,g){
 
 function groupBy(g){
   const map=new Map();
-  for(const p of PHOTOS){
+  for(const p of currentList()){
     const d=new Date(p.ts*1000);
     const {key,label,small}=keyFor(d,g);
     if(!map.has(key)) map.set(key,{key,label,small,items:[]});
@@ -775,8 +990,24 @@ function groupBy(g){
 
 function cellHTML(p){
   const badge=p.kind==="video"?`<div class="badge">${PLAY}</div>`:"";
-  return `<div class="cell" data-idx="__IDX__" data-id="${p.id}"><img loading="lazy" src="/thumb?id=${p.id}" alt="">${badge}<div class="cap">${p.iso}</div><div class="check"></div></div>`;
+  const gb=(p._count&&p._count>1)?`<div class="gbadge">${p._hasRaw?'RAW+JPG':('×'+p._count)}</div>`:"";
+  return `<div class="cell" data-idx="__IDX__" data-id="${p.id}"><img loading="lazy" src="/thumb?id=${p.id}" alt="">${badge}${gb}<div class="cap">${p.iso}</div><div class="check"></div></div>`;
 }
+
+// When grouping is on, collapse same-shot RAW+JPEG (same folder + base name) into one tile.
+function currentList(){
+  if(!state.group) return PHOTOS;
+  const m=new Map();
+  for(const p of PHOTOS){ if(!m.has(p.group)) m.set(p.group,[]); m.get(p.group).push(p); }
+  const reps=[];
+  for(const arr of m.values()){
+    if(arr.length===1){ reps.push(arr[0]); continue; }
+    const rep=arr.find(x=>x.web)||arr[0];
+    reps.push(Object.assign({},rep,{_group:arr.map(x=>x.id),_count:arr.length,_hasRaw:arr.some(x=>x.raw)}));
+  }
+  return reps;
+}
+function idsOf(p){ return (p&&p._group&&p._group.length)?p._group:[p.id]; }
 function gridHTML(items,offset){
   let h='<div class="grid">';
   items.forEach((p,i)=>{ h+=cellHTML(p).replace('__IDX__',offset+i); });
@@ -875,23 +1106,41 @@ function updateSelBar(){
 }
 function clearSelection(){ selected.clear(); applySelectionClasses(); }
 function selectAllVisible(){ viewList.forEach(p=>selected.add(p.id)); applySelectionClasses(); }
-async function deleteSelected(){
-  if(!selected.size) return;
-  const ids=[...selected];
+// Delete a set of tiles; expands grouped RAW+JPEG tiles to all their files.
+async function deletePhotos(reps){
+  const idset=new Set();
+  reps.forEach(p=>idsOf(p).forEach(i=>idset.add(i)));
+  const ids=[...idset];
+  if(!ids.length) return false;
+  const n=ids.length;
   const msg=CAN_RECYCLE
-    ? `Move ${ids.length} item${ids.length!==1?'s':''} to the Recycle Bin?`
-    : `Permanently delete ${ids.length} item${ids.length!==1?'s':''}?\nThis cannot be undone.`;
-  if(!window.confirm(msg)) return;
+    ? `Move ${n} file${n!==1?'s':''} to the Recycle Bin?`
+    : `Permanently delete ${n} file${n!==1?'s':''}?\nThis cannot be undone.`;
+  if(!window.confirm(msg)) return false;
   let j;
   try{ const r=await fetch('/delete_many?ids='+encodeURIComponent(ids.join(',')),{method:'POST'}); j=await r.json(); }
-  catch(e){ alert('Delete failed: '+e); return; }
-  if(!j||!j.ok){ alert('Delete failed.'); return; }
-  const gone=new Set(ids);
+  catch(e){ alert('Delete failed: '+e); return false; }
+  if(!j||!j.ok){ alert('Delete failed.'); return false; }
+  const failed=new Set(j.failed||[]);
+  const gone=new Set(ids); failed.forEach(f=>gone.delete(f));
   PHOTOS=PHOTOS.filter(p=>!gone.has(p.id));
-  selected.clear();
+  gone.forEach(i=>selected.delete(i));
   refreshSub();
+  if(failed.size) alert(`${failed.size} file(s) couldn't be deleted (they may be open or read-only).`);
+  return true;
+}
+async function deleteSelected(){
+  if(!selected.size) return;
+  const reps=[...selected].map(id=>viewList.find(x=>x.id===id)||PHOTOS.find(x=>x.id===id)).filter(Boolean);
+  if(!await deletePhotos(reps)) return;
+  selected.clear();
   const sc=main.scrollTop; render(); main.scrollTop=sc;
   updateSelBar();
+}
+async function delItem(p){
+  if(!p) return;
+  if(!await deletePhotos([p])) return;
+  const sc=main.scrollTop; render(); main.scrollTop=sc;
 }
 
 // ---- right-click context menu ----
@@ -905,24 +1154,9 @@ function showCtx(x,y,idx,id){
 function hideCtx(){ document.getElementById('ctx').style.display='none'; }
 function ctxOpen(){ const i=parseInt(document.getElementById('ctx').dataset.idx,10); hideCtx(); openLb(i); }
 function ctxSelect(){ const id=document.getElementById('ctx').dataset.id; hideCtx(); setSelectMode(true); selected.add(id); applySelectionClasses(); }
-function ctxDelete(){ const id=document.getElementById('ctx').dataset.id; hideCtx(); delById(id); }
+function ctxDelete(){ const i=parseInt(document.getElementById('ctx').dataset.idx,10); hideCtx(); delItem(viewList[i]); }
 document.addEventListener('click',hideCtx);
 document.addEventListener('scroll',hideCtx,true);
-
-async function delById(id){
-  const p=PHOTOS.find(x=>x.id===id); if(!p) return;
-  const msg=CAN_RECYCLE
-    ? `Move this ${p.kind} to the Recycle Bin?\n\n${p.name}`
-    : `Permanently delete this ${p.kind}?\n\n${p.name}\n\nThis cannot be undone.`;
-  if(!window.confirm(msg)) return;
-  let j;
-  try{ const r=await fetch('/delete?id='+encodeURIComponent(id),{method:'POST'}); j=await r.json(); }
-  catch(e){ alert('Delete failed: '+e); return; }
-  if(!j||!j.ok){ alert('Delete failed: '+((j&&j.error)||'unknown')); return; }
-  PHOTOS=PHOTOS.filter(x=>x.id!==id); selected.delete(id);
-  refreshSub();
-  const sc=main.scrollTop; render(); main.scrollTop=sc;
-}
 
 // lightbox — images load a downscaled preview (fast, and converts HEIC etc.)
 function openLb(i){
@@ -951,6 +1185,7 @@ function openLb(i){
   }
   document.getElementById('lbinfo').innerHTML=`<b>${p.name}</b><span>${p.iso}${p.kind==='video'?' · Video':''}</span>`;
   document.getElementById('lb').classList.add('open');
+  if(exifOpen) loadExif();
 }
 function closeLb(){ zReset(); document.getElementById('lbcontent').innerHTML=""; document.getElementById('lb').classList.remove('open'); }
 
@@ -989,18 +1224,8 @@ function step(d){ if(!viewList.length) return; lbIndex=(lbIndex+d+viewList.lengt
 
 async function del(){
   const p=viewList[lbIndex]; if(!p) return;
-  const what=p.kind==="video"?"video":"photo";
-  const msg=CAN_RECYCLE
-    ? `Move this ${what} to the Recycle Bin?\n\n${p.name}\n\nYou can restore it from the Recycle Bin if needed.`
-    : `Permanently delete this ${what}?\n\n${p.name}\n\nThis cannot be undone.`;
-  if(!window.confirm(msg)) return;
-  let j;
-  try{ const r=await fetch('/delete?id='+encodeURIComponent(p.id),{method:'POST'}); j=await r.json(); }
-  catch(e){ alert('Delete failed: '+e); return; }
-  if(!j||!j.ok){ alert('Delete failed: '+((j&&j.error)||'unknown error')); return; }
   const neighbor=(viewList[lbIndex+1]||viewList[lbIndex-1]||{}).id;
-  PHOTOS=PHOTOS.filter(x=>x.id!==p.id);
-  refreshSub();
+  if(!await deletePhotos([p])) return;
   const sc=main.scrollTop; render(); main.scrollTop=sc;
   if(neighbor){ const ni=viewList.findIndex(x=>x.id===neighbor); if(ni>=0){ openLb(ni); return; } }
   closeLb();
@@ -1022,9 +1247,10 @@ function refreshSub(){
 
 document.addEventListener('keydown',e=>{
   if(!document.getElementById('lb').classList.contains('open')) return;
-  if(e.key==="Escape") closeLb();
+  if(e.key==="Escape"){ if(exifOpen) toggleExif(); else closeLb(); }
   else if(e.key==="ArrowLeft") step(-1);
   else if(e.key==="ArrowRight") step(1);
+  else if(e.key==="i"||e.key==="I") toggleExif();
   else if(e.key==="Delete"||e.key==="Backspace"){ e.preventDefault(); del(); }
 });
 document.getElementById('lb').addEventListener('click',e=>{ if(e.target.id==='lb') closeLb(); });
@@ -1042,10 +1268,83 @@ sortBtn.addEventListener('click',()=>{
   render();
 });
 document.getElementById('selectbtn').addEventListener('click',()=>setSelectMode(!selectMode));
+document.getElementById('groupbtn').addEventListener('click',()=>{
+  state.group=!state.group; state.period=null;
+  document.getElementById('groupbtn').classList.toggle('active',state.group);
+  render();
+});
+document.getElementById('dupbtn').addEventListener('click',openDup);
+
+// ---- EXIF info panel ----
+let exifOpen=false;
+function toggleExif(){ exifOpen=!exifOpen; document.getElementById('exif').classList.toggle('show',exifOpen); if(exifOpen) loadExif(); }
+function loadExif(){
+  const p=viewList[lbIndex]; if(!p) return;
+  const body=document.getElementById('exifbody');
+  body.innerHTML='<div style="color:var(--muted)">Loading…</div>';
+  fetch('/exif?id='+encodeURIComponent(p.id)).then(r=>r.json()).then(d=>{
+    let html='';
+    for(const k of Object.keys(d)){ if(k==='_map') continue;
+      html+=`<div class="exrow"><span class="exk">${k}</span><span class="exv">${d[k]}</span></div>`; }
+    if(d._map) html+=`<a class="exmap" href="${d._map}" target="_blank" rel="noopener">View on map ↗</a>`;
+    body.innerHTML=html||'<div style="color:var(--muted)">No details available.</div>';
+  }).catch(()=>{ body.innerHTML='<div style="color:var(--muted)">Couldn\'t read details.</div>'; });
+}
+
+// ---- duplicates ----
+let dupGroups=[]; const dupSel=new Set();
+function openDup(){
+  document.getElementById('dupview').style.display='flex';
+  document.getElementById('dupsummary').textContent='';
+  document.getElementById('dupbody').innerHTML='<div class="empty"><div class="spinner" style="margin:0 auto 16px"></div>Scanning for duplicates…</div>';
+  dupSel.clear(); dupGroups=[];
+  fetch('/find_duplicates').then(r=>r.json()).then(renderDup)
+    .catch(()=>{ document.getElementById('dupbody').innerHTML='<div class="empty">Error scanning for duplicates.</div>'; });
+}
+function closeDup(){ document.getElementById('dupview').style.display='none'; dupSel.clear(); }
+function renderDup(d){
+  dupGroups=d.groups||[];
+  document.getElementById('dupsummary').textContent = d.extra? `${d.extra} extra cop${d.extra!==1?'ies':'y'} · ${d.wasted} reclaimable` : '';
+  const body=document.getElementById('dupbody');
+  if(!dupGroups.length){ body.innerHTML='<div class="empty">No duplicate files found.</div>'; return; }
+  let html='';
+  dupGroups.forEach(g=>{
+    html+=`<div class="dupgroup"><div class="dupg-h">${g.name} · ${g.count} copies · ${g.sizeText} each</div><div class="dupg-row">`;
+    g.ids.forEach((id,idx)=>{ html+=`<div class="dupitem ${idx===0?'keep':''}" data-id="${id}"><img loading="lazy" src="/thumb?id=${id}"><div class="dupitem-tag">${idx===0?'Keep':'<span class="delmark">Delete</span>'}</div></div>`; });
+    html+='</div></div>';
+  });
+  body.innerHTML=html;
+  dupGroups.forEach(g=>g.ids.slice(1).forEach(id=>dupSel.add(id)));
+  applyDupSel();
+  body.querySelectorAll('.dupitem').forEach(el=>{ el.onclick=()=>{ const id=el.dataset.id; dupSel.has(id)?dupSel.delete(id):dupSel.add(id); applyDupSel(); }; });
+}
+function applyDupSel(){
+  document.querySelectorAll('#dupbody .dupitem').forEach(el=>{
+    const sel=dupSel.has(el.dataset.id); el.classList.toggle('sel',sel);
+    el.querySelector('.dupitem-tag').innerHTML = sel?'<span class="delmark">Delete</span>':'Keep';
+  });
+}
+function dupSelectExtras(){ dupSel.clear(); dupGroups.forEach(g=>g.ids.slice(1).forEach(id=>dupSel.add(id))); applyDupSel(); }
+async function dupDelete(){
+  if(!dupSel.size){ alert('Nothing selected to delete.'); return; }
+  for(const g of dupGroups){ if(g.ids.every(id=>dupSel.has(id))){ alert('Keep at least one copy of "'+g.name+'".'); return; } }
+  const ids=[...dupSel];
+  const msg=CAN_RECYCLE?`Move ${ids.length} duplicate file${ids.length!==1?'s':''} to the Recycle Bin?`:`Permanently delete ${ids.length} duplicate file${ids.length!==1?'s':''}?\nThis cannot be undone.`;
+  if(!window.confirm(msg)) return;
+  let j; try{ const r=await fetch('/delete_many?ids='+encodeURIComponent(ids.join(',')),{method:'POST'}); j=await r.json(); }
+  catch(e){ alert('Delete failed: '+e); return; }
+  if(!j||!j.ok){ alert('Delete failed.'); return; }
+  const failed=new Set(j.failed||[]);
+  const gone=new Set(ids); failed.forEach(f=>gone.delete(f));
+  PHOTOS=PHOTOS.filter(p=>!gone.has(p.id)); refreshSub(); render();
+  if(failed.size) alert(`${failed.size} file(s) couldn't be deleted (they may be open or read-only).`);
+  openDup();
+}
 document.addEventListener('keydown',e=>{
   if(document.getElementById('lb').classList.contains('open')) return;
   if(e.key==="Escape"){
     if(document.getElementById('ctx').style.display==='block') hideCtx();
+    else if(document.getElementById('dupview').style.display==='flex') closeDup();
     else if(selectMode) setSelectMode(false);
   }
 });
@@ -1248,6 +1547,34 @@ class Handler(BaseHTTPRequestHandler):
                                "canRecycle": _send2trash is not None,
                                "rawOk": RAW_OK, "heifOk": HEIF_OK, "version": APP_VERSION,
                                "scanning": not SCAN["done"], "seen": SCAN["seen"]}).encode("utf-8")
+            self._send(200, "application/json", body)
+            return
+
+        if path == "/exif":
+            pid = (qs.get("id") or [""])[0]
+            fp = ID_TO_PATH.get(pid)
+            p = next((x for x in PHOTOS if x["id"] == pid), None)
+            if not fp or not p:
+                self._send(404, "application/json", b'{}'); return
+            info = read_exif(fp, p["kind"])
+            ordered = {}
+            ordered["Taken"] = p["iso"]
+            for k in ("Camera", "Lens", "Focal length", "Aperture", "Shutter", "ISO",
+                      "Dimensions", "Location", "Size"):
+                if k in info:
+                    ordered[k] = info[k]
+            if "_map" in info:
+                ordered["_map"] = info["_map"]
+            ordered["File"] = p["name"]
+            self._send(200, "application/json", json.dumps(ordered).encode("utf-8"))
+            return
+
+        if path == "/find_duplicates":
+            groups = find_duplicates()
+            total = sum(g["count"] - 1 for g in groups)
+            wasted = sum(g["size"] * (g["count"] - 1) for g in groups)
+            body = json.dumps({"groups": groups, "extra": total,
+                               "wasted": _human_size(wasted) if wasted else "0 B"}).encode("utf-8")
             self._send(200, "application/json", body)
             return
 
