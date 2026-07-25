@@ -44,7 +44,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -1170,6 +1170,31 @@ function updateSelBar(){
 }
 function clearSelection(){ selected.clear(); applySelectionClasses(); }
 function selectAllVisible(){ viewList.forEach(p=>selected.add(p.id)); applySelectionClasses(); }
+// Low-level: delete ids, and if some fail, offer to delete those permanently.
+// Returns a Set of ids that were actually removed.
+async function deleteIds(ids){
+  if(!ids.length) return new Set();
+  const send=async(list,permanent)=>{
+    const q='/delete_many?ids='+encodeURIComponent(list.join(','))+(permanent?'&permanent=1':'');
+    const r=await fetch(q,{method:'POST'}); return await r.json();
+  };
+  let j;
+  try{ j=await send(ids,false); }catch(e){ alert('Delete failed: '+e); return new Set(); }
+  if(!j||!j.ok){ alert('Delete failed.'); return new Set(); }
+  let failed=new Set(j.failed||[]);
+  if(failed.size){
+    const why=(j.errors&&j.errors.length)?('\n\nReason: '+j.errors.join('\n')):'';
+    if(window.confirm(`${failed.size} file(s) couldn't be sent to the Recycle Bin.${why}\n\nDelete them permanently instead? This cannot be undone.`)){
+      try{
+        const j2=await send([...failed],true);
+        const f2=new Set(j2.failed||[]); failed=f2;
+        if(f2.size){ const why2=(j2.errors&&j2.errors.length)?('\n\nReason: '+j2.errors.join('\n')):''; alert(`${f2.size} file(s) still couldn't be deleted.${why2}`); }
+      }catch(e){ alert('Permanent delete failed: '+e); }
+    }
+  }
+  return new Set(ids.filter(i=>!failed.has(i)));
+}
+
 // Delete a set of tiles; expands grouped RAW+JPEG tiles to all their files.
 async function deletePhotos(reps){
   const idset=new Set();
@@ -1181,16 +1206,11 @@ async function deletePhotos(reps){
     ? `Move ${n} file${n!==1?'s':''} to the Recycle Bin?`
     : `Permanently delete ${n} file${n!==1?'s':''}?\nThis cannot be undone.`;
   if(!window.confirm(msg)) return false;
-  let j;
-  try{ const r=await fetch('/delete_many?ids='+encodeURIComponent(ids.join(',')),{method:'POST'}); j=await r.json(); }
-  catch(e){ alert('Delete failed: '+e); return false; }
-  if(!j||!j.ok){ alert('Delete failed.'); return false; }
-  const failed=new Set(j.failed||[]);
-  const gone=new Set(ids); failed.forEach(f=>gone.delete(f));
-  PHOTOS=PHOTOS.filter(p=>!gone.has(p.id));
-  gone.forEach(i=>selected.delete(i));
+  const removed=await deleteIds(ids);
+  if(!removed.size) return false;
+  PHOTOS=PHOTOS.filter(p=>!removed.has(p.id));
+  removed.forEach(i=>selected.delete(i));
   refreshSub();
-  if(failed.size){ const why=(j.errors&&j.errors.length)?('\n\nReason: '+j.errors.join('\n')):''; alert(`${failed.size} file(s) couldn't be deleted.${why}`); }
   return true;
 }
 async function deleteSelected(){
@@ -1415,13 +1435,8 @@ async function dupDelete(){
   const ids=[...dupSel];
   const msg=CAN_RECYCLE?`Move ${ids.length} duplicate file${ids.length!==1?'s':''} to the Recycle Bin?`:`Permanently delete ${ids.length} duplicate file${ids.length!==1?'s':''}?\nThis cannot be undone.`;
   if(!window.confirm(msg)) return;
-  let j; try{ const r=await fetch('/delete_many?ids='+encodeURIComponent(ids.join(',')),{method:'POST'}); j=await r.json(); }
-  catch(e){ alert('Delete failed: '+e); return; }
-  if(!j||!j.ok){ alert('Delete failed.'); return; }
-  const failed=new Set(j.failed||[]);
-  const gone=new Set(ids); failed.forEach(f=>gone.delete(f));
-  PHOTOS=PHOTOS.filter(p=>!gone.has(p.id)); refreshSub(); render();
-  if(failed.size){ const why=(j.errors&&j.errors.length)?('\n\nReason: '+j.errors.join('\n')):''; alert(`${failed.size} file(s) couldn't be deleted.${why}`); }
+  const removed=await deleteIds(ids);
+  if(removed.size){ PHOTOS=PHOTOS.filter(p=>!removed.has(p.id)); refreshSub(); render(); }
   openDup();
 }
 document.addEventListener('keydown',e=>{
@@ -1484,19 +1499,21 @@ CTYPE = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
          ".webm": "video/webm", ".3gp": "video/3gpp"}
 
 
-def _delete_file(pid):
-    """Delete one item by id. Returns (ok, recycled, error)."""
+def _delete_file(pid, permanent=False):
+    """Delete one item by id. Returns (ok, recycled, error).
+    permanent=True removes the file outright (used as a fallback when the
+    Recycle Bin isn't available, e.g. on some external/network drives)."""
     global PHOTOS
     fp = ID_TO_PATH.get(pid)
     if not fp or not os.path.exists(fp):
         return False, False, "not found"
 
     def _do():
-        if _send2trash is not None:
-            _send2trash(fp)
-            return True
-        os.remove(fp)
-        return False
+        if permanent or _send2trash is None:
+            os.remove(fp)
+            return False
+        _send2trash(fp)
+        return True
 
     try:
         recycled = _do()
@@ -1584,11 +1601,20 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        # send2trash uses a Windows COM API that must be initialized per thread.
+        # ThreadingHTTPServer runs each request on a fresh thread, so do it here.
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.ole32.CoInitialize(None)
+            except Exception:
+                pass
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
+        permanent = (qs.get("permanent") or ["0"])[0] == "1"
         if parsed.path == "/delete":
             pid = (qs.get("id") or [""])[0]
-            ok, recycled, err = _delete_file(pid)
+            ok, recycled, err = _delete_file(pid, permanent)
             code = 404 if (not ok and err == "not found") else 200
             self._send(code, "application/json",
                        json.dumps({"ok": ok, "recycled": recycled, "error": err}).encode("utf-8"))
@@ -1601,7 +1627,7 @@ class Handler(BaseHTTPRequestHandler):
             failed = []
             errors = []
             for pid in id_list:
-                ok, recycled, err = _delete_file(pid)
+                ok, recycled, err = _delete_file(pid, permanent)
                 if ok:
                     deleted += 1
                     recycled_any = recycled_any or recycled
