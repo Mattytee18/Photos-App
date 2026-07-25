@@ -44,7 +44,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.9"
+APP_VERSION = "1.9.1"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -1507,12 +1507,14 @@ def _delete_file(pid, permanent=False):
     fp = ID_TO_PATH.get(pid)
     if not fp or not os.path.exists(fp):
         return False, False, "not found"
+    # Normalize mixed / and \ separators — the Recycle Bin API needs clean paths.
+    target = os.path.normpath(fp)
 
     def _do():
         if permanent or _send2trash is None:
-            os.remove(fp)
+            os.remove(target)
             return False
-        _send2trash(fp)
+        _send2trash(target)
         return True
 
     try:
@@ -1520,7 +1522,7 @@ def _delete_file(pid, permanent=False):
     except Exception as e1:
         # Common Windows cause: the file is read-only. Clear it and retry.
         try:
-            os.chmod(fp, stat.S_IWRITE)
+            os.chmod(target, stat.S_IWRITE)
             recycled = _do()
         except Exception as e2:
             return False, False, str(e2 or e1)
@@ -1876,7 +1878,7 @@ def _run_main():
         elif not folders:
             sys.exit("No folder selected.")
 
-    folders = [f for f in folders if os.path.isdir(f)]
+    folders = [os.path.normpath(f) for f in folders if os.path.isdir(f)]
     if not folders:
         sys.exit("No valid folder to scan. Run again to pick one.")
 
