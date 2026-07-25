@@ -43,7 +43,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.6"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -658,6 +658,7 @@ def find_duplicates():
                 groups.append({
                     "ids": g,
                     "name": os.path.basename(ID_TO_PATH.get(g[0], "")),
+                    "paths": [ID_TO_PATH.get(pid, "") for pid in g],
                     "size": size,
                     "sizeText": _human_size(size),
                     "count": len(g),
@@ -826,6 +827,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .dupitem.sel{border-color:#ff5c6c;}
   .dupitem.sel img{opacity:.5;}
   .dupitem.keep{border-color:#3ecf8e;}
+  .dup-eye{position:absolute;top:6px;right:6px;width:30px;height:30px;border-radius:50%;border:0;cursor:pointer;
+           background:rgba(10,12,16,.75);box-shadow:0 1px 4px rgba(0,0,0,.4);
+           display:flex;align-items:center;justify-content:center;opacity:.95;transition:.15s;z-index:2;}
+  .dup-eye:hover{background:var(--accent);transform:scale(1.08);}
+  .dup-path{position:absolute;top:6px;left:6px;right:42px;font-size:9.5px;color:#eef1f6;
+            background:rgba(10,12,16,.7);border-radius:6px;padding:3px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .dup-hint{position:absolute;bottom:26px;left:0;right:0;text-align:center;font-size:10px;color:#cfd3da;opacity:0;transition:.15s;pointer-events:none;}
+  .dupitem:hover .dup-hint{opacity:1;}
 
   /* lightbox */
   #lb{position:fixed;inset:0;z-index:60;display:none;align-items:center;justify-content:center;
@@ -952,6 +961,7 @@ let viewList=[];
 let lbIndex=0;
 let monthObserver=null;
 let zScale=1, ztx=0, zty=0, zDragging=false, zStartX=0, zStartY=0, zMoved=0;
+let dupReturn=false, savedViewList=null;
 const pad=n=>String(n).padStart(2,'0');
 const main=document.getElementById('main');
 const PLAY='<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
@@ -1187,7 +1197,12 @@ function openLb(i){
   document.getElementById('lb').classList.add('open');
   if(exifOpen) loadExif();
 }
-function closeLb(){ zReset(); document.getElementById('lbcontent').innerHTML=""; document.getElementById('lb').classList.remove('open'); }
+function closeLb(){ zReset(); document.getElementById('lbcontent').innerHTML=""; document.getElementById('lb').classList.remove('open');
+  if(dupReturn){ viewList=savedViewList||[]; dupReturn=false; savedViewList=null; } }
+function previewDupId(id){
+  const p=PHOTOS.find(x=>x.id===id); if(!p) return;
+  savedViewList=viewList; dupReturn=true; viewList=[p]; openLb(0);
+}
 
 // ---- zoom & pan (images only) ----
 function zApply(){
@@ -1308,15 +1323,25 @@ function renderDup(d){
   const body=document.getElementById('dupbody');
   if(!dupGroups.length){ body.innerHTML='<div class="empty">No duplicate files found.</div>'; return; }
   let html='';
+  const EYE='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#fff" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>';
   dupGroups.forEach(g=>{
     html+=`<div class="dupgroup"><div class="dupg-h">${g.name} · ${g.count} copies · ${g.sizeText} each</div><div class="dupg-row">`;
-    g.ids.forEach((id,idx)=>{ html+=`<div class="dupitem ${idx===0?'keep':''}" data-id="${id}"><img loading="lazy" src="/thumb?id=${id}"><div class="dupitem-tag">${idx===0?'Keep':'<span class="delmark">Delete</span>'}</div></div>`; });
+    g.ids.forEach((id,idx)=>{
+      const folder=(g.paths&&g.paths[idx])?g.paths[idx].replace(/[\\/][^\\/]*$/,''):'';
+      html+=`<div class="dupitem ${idx===0?'keep':''}" data-id="${id}" title="${g.paths?g.paths[idx]:''}">
+        <img loading="lazy" src="/thumb?id=${id}">
+        <div class="dup-path">${folder}</div>
+        <button class="dup-eye" data-id="${id}" title="Preview full size">${EYE}</button>
+        <div class="dup-hint">click thumbnail to keep/delete</div>
+        <div class="dupitem-tag">${idx===0?'Keep':'<span class="delmark">Delete</span>'}</div></div>`;
+    });
     html+='</div></div>';
   });
   body.innerHTML=html;
   dupGroups.forEach(g=>g.ids.slice(1).forEach(id=>dupSel.add(id)));
   applyDupSel();
   body.querySelectorAll('.dupitem').forEach(el=>{ el.onclick=()=>{ const id=el.dataset.id; dupSel.has(id)?dupSel.delete(id):dupSel.add(id); applyDupSel(); }; });
+  body.querySelectorAll('.dup-eye').forEach(el=>{ el.onclick=(e)=>{ e.stopPropagation(); previewDupId(el.dataset.id); }; });
 }
 function applyDupSel(){
   document.querySelectorAll('#dupbody .dupitem').forEach(el=>{
