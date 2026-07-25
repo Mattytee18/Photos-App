@@ -43,7 +43,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -643,6 +643,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
              display:flex;align-items:center;justify-content:center;}
   #lbcontent img,#lbcontent video{max-width:94vw;max-height:86vh;border-radius:12px;
        box-shadow:0 20px 70px rgba(0,0,0,.6);display:block;}
+  #lbcontent img{cursor:zoom-in;user-select:none;-webkit-user-drag:none;
+       transform-origin:center center;will-change:transform;}
   .spinner{width:44px;height:44px;border-radius:50%;border:3px solid rgba(255,255,255,.18);
            border-top-color:#fff;animation:spin .8s linear infinite;}
   @keyframes spin{to{transform:rotate(360deg)}}
@@ -734,6 +736,7 @@ const state={g:"all",sort:"newest",period:null};
 let viewList=[];
 let lbIndex=0;
 let monthObserver=null;
+let zScale=1, ztx=0, zty=0, zDragging=false, zStartX=0, zStartY=0, zMoved=0;
 const pad=n=>String(n).padStart(2,'0');
 const main=document.getElementById('main');
 const PLAY='<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
@@ -924,6 +927,7 @@ async function delById(id){
 // lightbox — images load a downscaled preview (fast, and converts HEIC etc.)
 function openLb(i){
   lbIndex=i; const p=viewList[i]; const box=document.getElementById('lbcontent');
+  zReset();
   if(p.kind==="video"){
     box.innerHTML=p.playable
       ? `<video src="/full?id=${p.id}" controls autoplay playsinline></video>`
@@ -931,7 +935,7 @@ function openLb(i){
            <p style="color:#9aa1ad">This video format can't play in the browser.<br>Open it from your folder.</p></div>`;
   } else {
     box.innerHTML=`<div class="spinner"></div>`;
-    const show=(image)=>{ if(viewList[lbIndex]===p){ box.innerHTML=''; box.appendChild(image); } };
+    const show=(image)=>{ if(viewList[lbIndex]===p){ image.draggable=false; box.innerHTML=''; box.appendChild(image); zApply(); } };
     // 1) show a fast preview immediately
     const fast=new Image();
     fast.onload=()=>{
@@ -948,7 +952,39 @@ function openLb(i){
   document.getElementById('lbinfo').innerHTML=`<b>${p.name}</b><span>${p.iso}${p.kind==='video'?' · Video':''}</span>`;
   document.getElementById('lb').classList.add('open');
 }
-function closeLb(){ document.getElementById('lbcontent').innerHTML=""; document.getElementById('lb').classList.remove('open'); }
+function closeLb(){ zReset(); document.getElementById('lbcontent').innerHTML=""; document.getElementById('lb').classList.remove('open'); }
+
+// ---- zoom & pan (images only) ----
+function zApply(){
+  const img=document.querySelector('#lbcontent img'); if(!img) return;
+  img.style.transform=`translate(${ztx}px,${zty}px) scale(${zScale})`;
+  img.style.cursor = zScale>1 ? (zDragging?'grabbing':'grab') : 'zoom-in';
+}
+function zReset(){ zScale=1; ztx=0; zty=0; zDragging=false; zMoved=0; zApply(); }
+function zZoomAt(cx,cy,newScale){
+  const img=document.querySelector('#lbcontent img'); if(!img) return;
+  newScale=Math.max(1,Math.min(8,newScale));
+  const r=img.getBoundingClientRect();
+  const dx=cx-(r.left+r.width/2), dy=cy-(r.top+r.height/2);
+  const k=newScale/zScale;
+  ztx+=dx*(1-k); zty+=dy*(1-k); zScale=newScale;
+  if(zScale<=1.001){ zScale=1; ztx=0; zty=0; }
+  zApply();
+}
+(function(){
+  const lbc=document.getElementById('lbcontent');
+  lbc.addEventListener('wheel',e=>{ if(!lbc.querySelector('img')) return; e.preventDefault();
+    zZoomAt(e.clientX,e.clientY, zScale*(e.deltaY<0?1.2:1/1.2)); },{passive:false});
+  lbc.addEventListener('mousedown',e=>{ if(!lbc.querySelector('img')) return;
+    if(zScale>1){ zDragging=true; zStartX=e.clientX; zStartY=e.clientY; zMoved=0; e.preventDefault(); zApply(); } });
+  window.addEventListener('mousemove',e=>{ if(!zDragging) return;
+    ztx+=e.clientX-zStartX; zty+=e.clientY-zStartY; zMoved+=Math.abs(e.clientX-zStartX)+Math.abs(e.clientY-zStartY);
+    zStartX=e.clientX; zStartY=e.clientY; zApply(); });
+  window.addEventListener('mouseup',()=>{ if(zDragging){ zDragging=false; zApply(); } });
+  lbc.addEventListener('click',e=>{ if(!lbc.querySelector('img')) return;
+    if(zMoved>4){ zMoved=0; return; }   // that was a drag, not a click
+    zZoomAt(e.clientX,e.clientY, zScale>1?1:2.5); });
+})();
 function step(d){ if(!viewList.length) return; lbIndex=(lbIndex+d+viewList.length)%viewList.length; openLb(lbIndex); }
 
 async function del(){
