@@ -44,7 +44,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -95,6 +95,12 @@ _DATETIME = 306
 
 THUMB_DIR = os.path.join(tempfile.gettempdir(), "photo_browser_thumbs")
 os.makedirs(THUMB_DIR, exist_ok=True)
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config"),
+    "PhotoBrowser")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CACHE_FILE = os.path.join(CONFIG_DIR, "scan_cache.json")
 
 FFMPEG = shutil.which("ffmpeg")
 
@@ -205,6 +211,23 @@ def read_taken_date(path, kind):
 
 # ---------------------------------------------------------------- scanning
 
+def load_scan_cache():
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_scan_cache(cache):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
 def scan(folders, debug=False):
     print("Scanning for photos and videos...")
     count = 0
@@ -213,6 +236,9 @@ def scan(folders, debug=False):
     folders_seen = 0
     seen_dirs = set()    # canonical dirs already walked (prevents symlink loops/dupes)
     seen_files = set()   # canonical files already indexed (prevents dupes)
+    cache = load_scan_cache()   # {path: {"m":mtime,"s":size,"t":taken_ts}}
+    new_cache = {}
+    cache_hits = 0
 
     def _onerr(err):
         err_dirs.append(getattr(err, "filename", "?"))
@@ -241,7 +267,19 @@ def scan(folders, debug=False):
                 if real_file in seen_files:
                     continue
                 seen_files.add(real_file)
-                dt = read_taken_date(full, kind)
+                try:
+                    st = os.stat(full)
+                    mtime, size = int(st.st_mtime), st.st_size
+                except OSError:
+                    mtime, size = 0, 0
+                prev = cache.get(real_file)
+                if prev and prev.get("m") == mtime and prev.get("s") == size:
+                    taken_ts = prev["t"]          # unchanged file — reuse cached date (fast)
+                    cache_hits += 1
+                else:
+                    taken_ts = read_taken_date(full, kind).timestamp()
+                new_cache[real_file] = {"m": mtime, "s": size, "t": taken_ts}
+                dt = datetime.fromtimestamp(taken_ts)
                 pid = hashlib.md5(full.encode("utf-8", "surrogatepass")).hexdigest()
                 stem = os.path.splitext(fname)[0].lower()
                 gkey = hashlib.md5((os.path.normcase(dirpath) + "|" + stem)
@@ -265,9 +303,12 @@ def scan(folders, debug=False):
 
     PHOTOS.sort(key=lambda p: p["ts"])
     SCAN["seen"] = count
+    save_scan_cache(new_cache)
     imgs = sum(1 for p in PHOTOS if p["kind"] == "image")
     vids = count - imgs
     print(f"\nFound {imgs:,} photos and {vids:,} videos in {folders_seen:,} folder(s).")
+    if cache_hits:
+        print(f"   ({cache_hits:,} unchanged files loaded from cache — fast relaunch)")
 
     if err_dirs:
         print(f"!  {len(err_dirs)} folder(s) couldn't be opened (permissions, or cloud-only "
@@ -681,7 +722,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     --bg:#0b0d12; --bg2:#0f1218; --surface:#151922; --surface2:#1b202b;
     --line:#242a36; --text:#eef1f6; --muted:#8b93a3; --muted2:#666e7e;
     --accent:#7c5cff; --accent2:#4f8cff; --shadow:0 8px 30px rgba(0,0,0,.45);
-    --hdr-h:66px;
+    --hdr-h:66px; --tile:170px;
   }
   *{box-sizing:border-box;}
   html,body{height:100%;}
@@ -743,7 +784,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .shead .big{font-size:19px;font-weight:700;letter-spacing:-.3px;}
   .shead .small{font-size:12.5px;color:var(--muted);}
 
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:12px;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tile),1fr));gap:12px;}
+  .sizeslider{display:flex;align-items:center;gap:8px;color:var(--muted);}
+  .sizeslider svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;}
+  input[type=range]#tilesize{-webkit-appearance:none;appearance:none;width:96px;height:4px;border-radius:3px;
+       background:var(--line);outline:none;cursor:pointer;}
+  input[type=range]#tilesize::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;
+       background:linear-gradient(135deg,var(--accent),var(--accent2));cursor:pointer;}
+  input[type=range]#tilesize::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;
+       background:var(--accent);cursor:pointer;}
   .cell{position:relative;aspect-ratio:1/1;border-radius:14px;overflow:hidden;
         cursor:pointer;background:var(--surface);
         box-shadow:0 1px 2px rgba(0,0,0,.4);transition:transform .18s, box-shadow .18s;}
@@ -879,6 +928,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button class="seg" data-g="month">Month</button>
     <button class="seg" data-g="week">Week</button>
     <button class="seg" data-g="day">Day</button>
+  </div>
+  <div class="sizeslider" title="Thumbnail size">
+    <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    <input type="range" id="tilesize" min="110" max="340" value="170">
   </div>
   <button class="sortbtn" id="sortbtn" title="Toggle sort order">
     <svg viewBox="0 0 24 24"><path d="M12 4v16M12 4l-5 5M12 4l5 5"/></svg>
@@ -1283,6 +1336,11 @@ sortBtn.addEventListener('click',()=>{
   document.getElementById('sortlabel').textContent=state.sort==="newest"?"Newest":"Oldest";
   render();
 });
+const tile=document.getElementById('tilesize');
+try{ const saved=localStorage.getItem('tileSize'); if(saved) tile.value=saved; }catch(e){}
+function applyTile(){ document.documentElement.style.setProperty('--tile',tile.value+'px'); try{ localStorage.setItem('tileSize',tile.value); }catch(e){} }
+tile.addEventListener('input',applyTile); applyTile();
+
 document.getElementById('selectbtn').addEventListener('click',()=>setSelectMode(!selectMode));
 document.getElementById('groupbtn').addEventListener('click',()=>{
   state.group=!state.group; state.period=null;
@@ -1651,12 +1709,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------- config / folder
-
-CONFIG_DIR = os.path.join(
-    os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config"),
-    "PhotoBrowser")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-
 
 def load_config():
     try:
