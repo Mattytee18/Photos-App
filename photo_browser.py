@@ -44,7 +44,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.9.1"
+APP_VERSION = "2.0"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -101,8 +101,29 @@ CONFIG_DIR = os.path.join(
     "PhotoBrowser")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CACHE_FILE = os.path.join(CONFIG_DIR, "scan_cache.json")
+ROT_FILE = os.path.join(CONFIG_DIR, "rotations.json")
 
 FFMPEG = shutil.which("ffmpeg")
+
+ROTATIONS = {}  # {path: degrees clockwise} — non-destructive, remembered rotations
+
+
+def load_rotations():
+    global ROTATIONS
+    try:
+        with open(ROT_FILE, "r", encoding="utf-8") as f:
+            ROTATIONS = json.load(f)
+    except Exception:
+        ROTATIONS = {}
+
+
+def save_rotations():
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(ROT_FILE, "w", encoding="utf-8") as f:
+            json.dump(ROTATIONS, f)
+    except Exception:
+        pass
 
 PHOTOS = []
 ID_TO_PATH = {}
@@ -397,7 +418,7 @@ def _largest_embedded_jpeg(path):
     return None
 
 
-def raw_jpeg_bytes(path, max_dim, quality):
+def raw_jpeg_bytes(path, max_dim, quality, rotate_deg=0):
     """Return a JPEG for a RAW file. Uses the embedded preview (no dependencies);
     falls back to rawpy only if that fails and rawpy happens to be available."""
     im = None
@@ -417,6 +438,8 @@ def raw_jpeg_bytes(path, max_dim, quality):
     if im is None:
         return None
     im = ImageOps.exif_transpose(im).convert("RGB")
+    if rotate_deg:
+        im = im.rotate(-rotate_deg, expand=True)
     if max(im.size) > max_dim:
         im.thumbnail((max_dim, max_dim))
     buf = io.BytesIO()
@@ -429,14 +452,15 @@ def make_image_thumb(path, pid):
         mtime = int(os.path.getmtime(path))
     except OSError:
         mtime = 0
-    cache_file = _cache_path(pid, mtime, "")
+    deg = ROTATIONS.get(path, 0)
+    cache_file = _cache_path(pid, mtime, f"r{deg}")
     if os.path.exists(cache_file):
         with open(cache_file, "rb") as f:
             return f.read()
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in RAW_EXTS:
-            data = raw_jpeg_bytes(path, max(THUMB_SIZE), 82)
+            data = raw_jpeg_bytes(path, max(THUMB_SIZE), 82, rotate_deg=deg)
             if not data:
                 return None
         else:
@@ -444,6 +468,8 @@ def make_image_thumb(path, pid):
                 img.draft("RGB", THUMB_SIZE)          # fast JPEG downscale-on-decode
                 img = ImageOps.exif_transpose(img)    # honor camera rotation
                 img = img.convert("RGB")
+                if deg:
+                    img = img.rotate(-deg, expand=True)
                 img.thumbnail(THUMB_SIZE)
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=82)
@@ -462,14 +488,15 @@ def make_preview(path, pid):
         mtime = int(os.path.getmtime(path))
     except OSError:
         mtime = 0
-    cache_file = _cache_path(pid, mtime, "_pv")
+    deg = ROTATIONS.get(path, 0)
+    cache_file = _cache_path(pid, mtime, f"_pvr{deg}")
     if os.path.exists(cache_file):
         with open(cache_file, "rb") as f:
             return f.read()
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in RAW_EXTS:
-            data = raw_jpeg_bytes(path, PREVIEW_MAX, PREVIEW_QUALITY)
+            data = raw_jpeg_bytes(path, PREVIEW_MAX, PREVIEW_QUALITY, rotate_deg=deg)
             if not data:
                 return None
         else:
@@ -477,6 +504,8 @@ def make_preview(path, pid):
                 img.draft("RGB", (PREVIEW_MAX, PREVIEW_MAX))
                 img = ImageOps.exif_transpose(img)
                 img = img.convert("RGB")
+                if deg:
+                    img = img.rotate(-deg, expand=True)
                 if max(img.size) > PREVIEW_MAX:
                     img.thumbnail((PREVIEW_MAX, PREVIEW_MAX))
                 buf = io.BytesIO()
@@ -824,6 +853,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
          transform:rotate(45deg);margin-top:-2px;}
   .cell.sel{outline:3px solid var(--accent);outline-offset:-3px;}
   .cell.sel img{transform:scale(.92);}
+  .marquee{position:fixed;z-index:45;border:1.5px solid var(--accent);background:rgba(124,92,255,.16);border-radius:2px;pointer-events:none;}
 
   #selbar{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:40;display:none;
           align-items:center;gap:16px;padding:10px 12px 10px 20px;border-radius:16px;
@@ -964,6 +994,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="lbbar">
     <div class="info" id="lbinfo"></div>
     <div class="lbactions">
+      <button class="iconbtn" onclick="rotate('ccw')" title="Rotate left"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5"/></svg></button>
+      <button class="iconbtn" onclick="rotate('cw')" title="Rotate right (R)"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8m0-5v5h-5"/></svg></button>
       <button class="iconbtn" onclick="toggleExif()" title="Photo info (i)"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></button>
       <button class="iconbtn danger" onclick="del()" title="Delete (Del)"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M10 11v6M14 11v6M6 7l1 13h10l1-13"/></svg></button>
       <button class="iconbtn" onclick="closeLb()" title="Close (Esc)"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
@@ -1055,7 +1087,7 @@ function groupBy(g){
 function cellHTML(p){
   const badge=p.kind==="video"?`<div class="badge">${PLAY}</div>`:"";
   const gb=(p._count&&p._count>1)?`<div class="gbadge">${p._hasRaw?'RAW+JPG':('×'+p._count)}</div>`:"";
-  return `<div class="cell" data-idx="__IDX__" data-id="${p.id}"><img loading="lazy" src="/thumb?id=${p.id}" alt="">${badge}${gb}<div class="cap">${p.iso}</div><div class="check"></div></div>`;
+  return `<div class="cell" data-idx="__IDX__" data-id="${p.id}"><img loading="lazy" src="/thumb?id=${p.id}&r=${p.rot||0}" alt="">${badge}${gb}<div class="cap">${p.iso}</div><div class="check"></div></div>`;
 }
 
 // When grouping is on, collapse same-shot RAW+JPEG (same folder + base name) into one tile.
@@ -1140,11 +1172,42 @@ function renderPeriods(){
 }
 function bindCells(){
   main.querySelectorAll('.cell').forEach(c=>{
-    c.onclick=()=>{ if(selectMode) toggleSelect(c.dataset.id,c); else openLb(parseInt(c.dataset.idx,10)); };
+    c.onclick=()=>{ if(suppressClick) return; if(selectMode) toggleSelect(c.dataset.id,c); else openLb(parseInt(c.dataset.idx,10)); };
     c.oncontextmenu=(e)=>{ e.preventDefault(); showCtx(e.clientX,e.clientY,parseInt(c.dataset.idx,10),c.dataset.id); };
   });
   applySelectionClasses();
 }
+
+// ---- drag-to-select (marquee) ----
+let mqPending=false, mqActive=false, mqSX=0, mqSY=0, mqBase=null, mqEl=null, suppressClick=false;
+main.addEventListener('mousedown',e=>{
+  if(e.button!==0) return;
+  mqPending=true; mqActive=false; mqSX=e.clientX; mqSY=e.clientY;
+});
+window.addEventListener('mousemove',e=>{
+  if(!mqPending) return;
+  if(!mqActive){
+    if(Math.abs(e.clientX-mqSX)+Math.abs(e.clientY-mqSY)<6) return;
+    mqActive=true;
+    if(!selectMode) setSelectMode(true);
+    mqBase = e.shiftKey ? new Set(selected) : new Set();
+    mqEl=document.createElement('div'); mqEl.className='marquee'; document.body.appendChild(mqEl);
+    document.body.style.userSelect='none';
+  }
+  const l=Math.min(mqSX,e.clientX), t=Math.min(mqSY,e.clientY), r=Math.max(mqSX,e.clientX), b=Math.max(mqSY,e.clientY);
+  mqEl.style.left=l+'px'; mqEl.style.top=t+'px'; mqEl.style.width=(r-l)+'px'; mqEl.style.height=(b-t)+'px';
+  const sel=new Set(mqBase);
+  main.querySelectorAll('.cell').forEach(c=>{
+    const q=c.getBoundingClientRect();
+    if(!(q.right<l||q.left>r||q.bottom<t||q.top>b)) sel.add(c.dataset.id);
+  });
+  selected.clear(); sel.forEach(id=>selected.add(id)); applySelectionClasses();
+});
+window.addEventListener('mouseup',()=>{
+  if(mqActive){ mqActive=false; if(mqEl){ mqEl.remove(); mqEl=null; } document.body.style.userSelect='';
+    suppressClick=true; setTimeout(()=>{ suppressClick=false; },0); }
+  mqPending=false;
+});
 
 // ---- multi-select ----
 function setSelectMode(on){
@@ -1258,14 +1321,14 @@ function openLb(i){
     const fast=new Image();
     fast.onload=()=>{
       show(fast);
-      // 2) then sharpen to the full-resolution original (for browser-native formats)
-      if(p.web){ const full=new Image(); full.onload=()=>show(full); full.src=`/full?id=${p.id}`; }
+      // 2) then sharpen to the full-resolution original (skip when rotated — /full is unrotated)
+      if(p.web && !p.rot){ const full=new Image(); full.onload=()=>show(full); full.src=`/full?id=${p.id}`; }
     };
     fast.onerror=()=>{ if(viewList[lbIndex]!==p) return;
       let hint="If it's an iPhone HEIC file, install pillow-heif (see README).";
       if(p.raw) hint="This RAW file has no usable embedded preview to display.";
       box.innerHTML=`<div class="lberr">Couldn't display <b>${p.name}</b>.<br><span style="color:#9aa1ad">${hint}</span></div>`; };
-    fast.src=`/preview?id=${p.id}`;
+    fast.src=`/preview?id=${p.id}&r=${p.rot||0}`;
   }
   document.getElementById('lbinfo').innerHTML=`<b>${p.name}</b><span>${p.iso}${p.kind==='video'?' · Video':''}</span>`;
   document.getElementById('lb').classList.add('open');
@@ -1273,6 +1336,21 @@ function openLb(i){
 }
 function closeLb(){ zReset(); document.getElementById('lbcontent').innerHTML=""; document.getElementById('lb').classList.remove('open');
   if(dupReturn){ viewList=savedViewList||[]; dupReturn=false; savedViewList=null; } }
+
+async function rotate(dir){
+  const p=viewList[lbIndex]; if(!p||p.kind!=='image') return;
+  let j;
+  try{ const r=await fetch('/rotate?id='+encodeURIComponent(p.id)+'&dir='+dir,{method:'POST'}); j=await r.json(); }
+  catch(e){ return; }
+  if(!j||!j.ok) return;
+  p.rot=j.deg;
+  const base=PHOTOS.find(x=>x.id===p.id); if(base) base.rot=j.deg;
+  const box=document.getElementById('lbcontent'); box.innerHTML='<div class="spinner"></div>'; zReset();
+  const img=new Image(); img.draggable=false;
+  img.onload=()=>{ if(viewList[lbIndex]===p){ box.innerHTML=''; box.appendChild(img); zApply(); } };
+  img.src='/preview?id='+p.id+'&r='+(p.rot||0);
+  const cell=main.querySelector('.cell[data-id="'+p.id+'"] img'); if(cell) cell.src='/thumb?id='+p.id+'&r='+(p.rot||0);
+}
 function previewDupId(id){
   const p=PHOTOS.find(x=>x.id===id); if(!p) return;
   savedViewList=viewList; dupReturn=true; viewList=[p]; openLb(0);
@@ -1340,6 +1418,7 @@ document.addEventListener('keydown',e=>{
   else if(e.key==="ArrowLeft") step(-1);
   else if(e.key==="ArrowRight") step(1);
   else if(e.key==="i"||e.key==="I") toggleExif();
+  else if(e.key==="r"||e.key==="R") rotate('cw');
   else if(e.key==="Delete"||e.key==="Backspace"){ e.preventDefault(); del(); }
 });
 document.getElementById('lb').addEventListener('click',e=>{ if(e.target.id==='lb') closeLb(); });
@@ -1621,6 +1700,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send(code, "application/json",
                        json.dumps({"ok": ok, "recycled": recycled, "error": err}).encode("utf-8"))
             return
+        if parsed.path == "/rotate":
+            pid = (qs.get("id") or [""])[0]
+            direction = (qs.get("dir") or ["cw"])[0]
+            fp = ID_TO_PATH.get(pid)
+            if not fp:
+                self._send(404, "application/json", b'{"ok":false}'); return
+            cur = ROTATIONS.get(fp, 0)
+            cur = (cur + (90 if direction == "cw" else -90)) % 360
+            if cur:
+                ROTATIONS[fp] = cur
+            else:
+                ROTATIONS.pop(fp, None)
+            save_rotations()
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "deg": cur}).encode("utf-8"))
+            return
+
         if parsed.path == "/delete_many":
             ids = (qs.get("ids") or [""])[0]
             id_list = [x for x in ids.split(",") if x]
@@ -1657,7 +1753,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/photos":
-            snap = list(PHOTOS)  # snapshot (scan may still be appending)
+            snap = []
+            for p in list(PHOTOS):  # snapshot (scan may still be appending)
+                deg = ROTATIONS.get(ID_TO_PATH.get(p["id"], ""), 0)
+                if deg:
+                    p = dict(p, rot=deg)
+                snap.append(p)
             rng = ""
             if snap:
                 ts = [p["ts"] for p in snap]
@@ -1883,6 +1984,7 @@ def _run_main():
         sys.exit("No valid folder to scan. Run again to pick one.")
 
     write_startup_log(folders)
+    load_rotations()
 
     # Start the web server, then scan in the background so the window shows at once.
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
