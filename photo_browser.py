@@ -43,7 +43,7 @@ try:
 except ImportError:
     sys.exit("Pillow is required. Install it with:  pip install Pillow")
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 # Optional: lets Pillow read iPhone/HEIC photos so they display + thumbnail.
 try:
@@ -285,10 +285,8 @@ def scan(folders, debug=False):
         print(f"i  {heic:,} HEIC/HEIF photos found. To view them, install pillow-heif:  "
               f"pip install pillow-heif")
     raws = sum(1 for p in PHOTOS if os.path.splitext(p["name"])[1].lower() in RAW_EXTS)
-    if raws and not RAW_OK:
-        print(f"i  {raws:,} camera RAW files found. To view them, install rawpy:  pip install rawpy")
-    elif raws:
-        print(f"i  {raws:,} camera RAW files — showing their embedded previews.")
+    if raws:
+        print(f"i  {raws:,} camera RAW files — showing their embedded previews (built in, no add-on needed).")
     if vids and not FFMPEG:
         print("i  ffmpeg not found — videos play, but show a placeholder thumbnail.")
 
@@ -316,22 +314,62 @@ def _cache_path(pid, mtime, suffix):
     return os.path.join(THUMB_DIR, f"{pid}_{mtime}{suffix}.jpg")
 
 
+def _largest_embedded_jpeg(path):
+    """Find the largest embedded JPEG inside a RAW file (pure Python, no deps).
+    Camera RAWs (Sony .ARW, etc.) carry a full-size JPEG preview — we extract it."""
+    import mmap
+    try:
+        with open(path, "rb") as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                cands = []
+                start = 0
+                while True:
+                    i = mm.find(b"\xff\xd8\xff", start)
+                    if i < 0:
+                        break
+                    j = mm.find(b"\xff\xd9", i + 3)
+                    if j < 0:
+                        break
+                    cands.append((j + 2 - i, i, j + 2))
+                    start = j + 2
+                    if len(cands) > 96:
+                        break
+                cands.sort(reverse=True)  # largest first
+                for _ln, i, end in cands[:6]:
+                    seg = mm[i:end]
+                    try:
+                        im = Image.open(io.BytesIO(seg))
+                        im.load()
+                        return seg
+                    except Exception:
+                        continue
+            finally:
+                mm.close()
+    except Exception:
+        return None
+    return None
+
+
 def raw_jpeg_bytes(path, max_dim, quality):
-    """Turn a camera RAW file into a JPEG. Uses the full-size preview embedded
-    in the RAW when available (fast); otherwise develops the RAW (slower)."""
-    with rawpy.imread(path) as raw:
-        im = None
+    """Return a JPEG for a RAW file. Uses the embedded preview (no dependencies);
+    falls back to rawpy only if that fails and rawpy happens to be available."""
+    im = None
+    seg = _largest_embedded_jpeg(path)
+    if seg is not None:
         try:
-            thumb = raw.extract_thumb()
-            if thumb.format == rawpy.ThumbFormat.JPEG:
-                im = Image.open(io.BytesIO(thumb.data))
-            elif thumb.format == rawpy.ThumbFormat.BITMAP:
-                im = Image.fromarray(thumb.data)
+            im = Image.open(io.BytesIO(seg))
+            im.draft("RGB", (max_dim, max_dim))
         except Exception:
             im = None
-        if im is None:
-            rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=False)
-            im = Image.fromarray(rgb)
+    if im is None and RAW_OK:
+        try:
+            with rawpy.imread(path) as raw:
+                im = Image.fromarray(raw.postprocess(use_camera_wb=True, half_size=True))
+        except Exception:
+            im = None
+    if im is None:
+        return None
     im = ImageOps.exif_transpose(im).convert("RGB")
     if max(im.size) > max_dim:
         im.thumbnail((max_dim, max_dim))
@@ -351,8 +389,10 @@ def make_image_thumb(path, pid):
             return f.read()
     ext = os.path.splitext(path)[1].lower()
     try:
-        if ext in RAW_EXTS and RAW_OK:
+        if ext in RAW_EXTS:
             data = raw_jpeg_bytes(path, max(THUMB_SIZE), 82)
+            if not data:
+                return None
         else:
             with Image.open(path) as img:
                 img.draft("RGB", THUMB_SIZE)          # fast JPEG downscale-on-decode
@@ -382,8 +422,10 @@ def make_preview(path, pid):
             return f.read()
     ext = os.path.splitext(path)[1].lower()
     try:
-        if ext in RAW_EXTS and RAW_OK:
+        if ext in RAW_EXTS:
             data = raw_jpeg_bytes(path, PREVIEW_MAX, PREVIEW_QUALITY)
+            if not data:
+                return None
         else:
             with Image.open(path) as img:
                 img.draft("RGB", (PREVIEW_MAX, PREVIEW_MAX))
@@ -899,8 +941,7 @@ function openLb(i){
     };
     fast.onerror=()=>{ if(viewList[lbIndex]!==p) return;
       let hint="If it's an iPhone HEIC file, install pillow-heif (see README).";
-      if(p.raw && !rawSupport) hint="RAW support isn't loaded in this build — the rawpy library didn't bundle into the .exe. Rebuild, then check startup.log (see below).";
-      else if(p.raw) hint="This RAW file couldn't be decoded.";
+      if(p.raw) hint="This RAW file has no usable embedded preview to display.";
       box.innerHTML=`<div class="lberr">Couldn't display <b>${p.name}</b>.<br><span style="color:#9aa1ad">${hint}</span></div>`; };
     fast.src=`/preview?id=${p.id}`;
   }
@@ -939,7 +980,7 @@ function refreshSub(){
     rng=` · ${f(Math.min(...ts))} – ${f(Math.max(...ts))}`;
   }
   const scan = scanning ? ` · scanning… (${(scanSeen||PHOTOS.length).toLocaleString()} found)` : '';
-  const ver = appVersion ? ` · v${appVersion}${rawSupport?'':' · RAW off'}` : '';
+  const ver = appVersion ? ` · v${appVersion}` : '';
   document.getElementById('sub').textContent=`${imgs.toLocaleString()} photos · ${vids.toLocaleString()} videos${rng}${scan}${ver}`;
 }
 
@@ -1267,8 +1308,9 @@ def write_startup_log(folders):
         f"python: {sys.version.split()[0]}",
         f"running as bundled .exe: {getattr(sys, 'frozen', False)}",
         f"folders: {folders}",
-        f"RAW (rawpy) loaded: {RAW_OK}" +
-        (f"  [rawpy {getattr(rawpy, '__version__', '?')}]" if RAW_OK else f"  ERROR: {RAW_ERR}"),
+        "RAW display: built-in embedded-preview extractor (always on)",
+        f"RAW full-decode (rawpy) loaded: {RAW_OK}" +
+        (f"  [rawpy {getattr(rawpy, '__version__', '?')}]" if RAW_OK else f"  (optional; not bundled: {RAW_ERR})"),
         f"HEIC (pillow-heif) loaded: {HEIF_OK}" + ("" if HEIF_OK else f"  ERROR: {HEIF_ERR}"),
         f"Recycle Bin (send2trash): {_send2trash is not None}",
         f"ffmpeg: {FFMPEG or 'not found'}",
